@@ -1,0 +1,22 @@
+# .gitignore file
+
+# virtual environment
+/.venv
+
+# capture files
+/captures
+
+# images
+/images
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE specific files
+.vscode/
+
+# DS_Store
+.DS_Store
