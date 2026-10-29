@@ -121,7 +121,8 @@ def top_conversations(packets, n=5):
         list: A list of tuples containing the conversation (src, dst) and its packet count, sorted by count in descending order.
     """
     counts = conversations(packets)
-    sorted_counts = sorted(counts.items(), key=lambda item: item[1], reverse=True)
+    # count conversations and filter out source-less conversations
+    sorted_counts = sorted(counts.items(), key=lambda item: item[1] if item[0][0] is not None else 0, reverse=True)
     return sorted_counts[:n]
 
 def traffic_over_time(packets):
