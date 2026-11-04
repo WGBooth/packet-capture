@@ -11,7 +11,9 @@ import pytest
 # imported from where each is defined; scapy.all builds its names at runtime, so Pylance can't see them
 from scapy.layers.inet import IP, TCP
 from scapy.layers.l2 import Ether
+from scapy.packet import Raw
 from scapy.utils import wrpcap
+import packet_capture.analysis as ana
 from packet_capture.capture import capture_file
 from packet_capture.packet import Packet
 
@@ -135,3 +137,49 @@ def test_generated_tcp_syn(tmp_path):
     assert pkt.transport == "TCP"
     assert pkt.flags == ["SYN"]
     assert pkt.length == 54   # Ethernet (14) + IP (20) + TCP (20) headers, no data
+
+def test_generated_packet_with_two_flags(tmp_path):
+    syn_ack = Ether() / IP(src="10.0.0.1", dst="10.0.0.2") / TCP(sport=80, dport=50000, flags="SA")
+    [pkt] = write_capture(tmp_path, [syn_ack])
+    assert pkt.flags == ["SYN", "ACK"]   # Scapy's "SA"; tshark flags as 0x012 (SYN 0x02, ACK 0x10)
+
+def test_generated_tcp_handshake(tmp_path):
+    client, server = "10.0.0.2", "10.0.0.1"
+    packets = write_capture(tmp_path, [
+        Ether() / IP(src=client, dst=server) / TCP(sport=50000, dport=80, flags="S"),
+        Ether() / IP(src=server, dst=client) / TCP(sport=80, dport=50000, flags="SA"),
+        Ether() / IP(src=client, dst=server) / TCP(sport=50000, dport=80, flags="A"),
+    ])
+    [connection] = ana.tcp_connections(packets)
+    assert (connection.client, connection.client_port) == (client, "50000")
+    assert (connection.server, connection.server_port) == (server, "80")
+    assert connection.packets == 3
+    assert connection.handshake is True
+    assert connection.status == "open"   # not closed yet
+    assert ana.tcp_handshake_identifier(packets) == [(client, server)]
+
+def test_generated_tcp_graceful_close(tmp_path):
+    client, server = "10.0.0.2", "10.0.0.1"
+    to_server = Ether() / IP(src=client, dst=server)
+    to_client = Ether() / IP(src=server, dst=client)
+    generated = [
+        to_server / TCP(sport=50000, dport=80, flags="S"),                     # handshake
+        to_client / TCP(sport=80, dport=50000, flags="SA"),
+        to_server / TCP(sport=50000, dport=80, flags="A"),
+        to_server / TCP(sport=50000, dport=80, flags="PA") / Raw(b"x" * 100),  # 100 bytes of data up
+        to_client / TCP(sport=80, dport=50000, flags="PA") / Raw(b"y" * 500),  # 500 bytes of data down
+        to_server / TCP(sport=50000, dport=80, flags="FA"),                    # client closes
+        to_client / TCP(sport=80, dport=50000, flags="FA"),                    # server closes
+        to_server / TCP(sport=50000, dport=80, flags="A"),                     # client acknowledges
+    ]
+    # one packet every 0.1 seconds, so the connection lasts 0.7 seconds
+    for i, packet in enumerate(generated):
+        packet.time = 1_700_000_000 + i * 0.1
+    [connection] = ana.tcp_connections(write_capture(tmp_path, generated))
+    assert connection.packets == 8
+    # paket times 54 bytes of headers plus data length of raw bytes
+    assert connection.bytes_from_client == 5 * 54 + 100
+    assert connection.bytes_from_server == 3 * 54 + 500
+    assert connection.duration.total_seconds() == pytest.approx(0.7)
+    assert connection.handshake is True
+    assert connection.status == "closed"
