@@ -8,6 +8,10 @@ capture[i] is frame i + 1: the list starts at 0, but Wireshark numbers frames fr
 
 from pathlib import Path
 import pytest
+# imported from where each is defined; scapy.all builds its names at runtime, so Pylance can't see them
+from scapy.layers.inet import IP, TCP
+from scapy.layers.l2 import Ether
+from scapy.utils import wrpcap
 from packet_capture.capture import capture_file
 from packet_capture.packet import Packet
 
@@ -109,3 +113,25 @@ def test_live_network_capture():
 @pytest.mark.skip(reason="TODO")
 def test_remote_capture():
     ...
+
+# ---- Generated traffic (Scapy) ----
+# Packets built with Scapy, so the expected values are worked out from what was generated,
+# not looked up in a capture.
+
+def write_capture(tmp_path, packets):
+    """Writes Scapy packets to a .pcap in tmp_path and reads them back as Packet objects."""
+    path = str(tmp_path / "generated.pcap")
+    wrpcap(path, packets)
+    cap = capture_file(path)
+    result = [Packet(raw_packet) for raw_packet in cap]
+    cap.close()
+    return result
+
+def test_generated_tcp_syn(tmp_path):
+    syn = Ether() / IP(src="10.0.0.2", dst="10.0.0.1") / TCP(sport=50000, dport=80, flags="S")
+    [pkt] = write_capture(tmp_path, [syn])
+    assert (pkt.src, pkt.dst) == ("10.0.0.2", "10.0.0.1")
+    assert (pkt.src_port, pkt.dst_port) == ("50000", "80")
+    assert pkt.transport == "TCP"
+    assert pkt.flags == ["SYN"]
+    assert pkt.length == 54   # Ethernet (14) + IP (20) + TCP (20) headers, no data
