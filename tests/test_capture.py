@@ -183,3 +183,17 @@ def test_generated_tcp_graceful_close(tmp_path):
     assert connection.duration.total_seconds() == pytest.approx(0.7)
     assert connection.handshake is True
     assert connection.status == "closed"
+
+def test_generated_tcp_refused(tmp_path):
+    """TCP connection refused because server is not listening on port 8080, but on 80"""
+    client, server = "10.0.0.2", "10.0.0.1"
+    packets = write_capture(tmp_path, [
+        Ether() / IP(src=client, dst=server) / TCP(sport=50001, dport=8080, flags="S"),
+        Ether() / IP(src=server, dst=client) / TCP(sport=8080, dport=50001, flags="RA"),
+    ])
+    assert packets[1].flags == ["RST", "ACK"]
+    [connection] = ana.tcp_connections(packets)
+    assert (connection.client, connection.server_port) == (client, "8080")
+    assert connection.packets == 2
+    assert connection.handshake is False   # the SYN-ACK never came
+    assert connection.status == "reset"
