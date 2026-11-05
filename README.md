@@ -1,5 +1,7 @@
 # Packet Capture and Analyzer
 
+[![Tests](https://github.com/WGBooth/packet-capture/actions/workflows/tests.yml/badge.svg?branch=dev)](https://github.com/WGBooth/packet-capture/actions/workflows/tests.yml)
+
 ## Description
 This program captures and analyzes network packets through a web GUI built with Streamlit. There are three different methods of capturing packets:
 
