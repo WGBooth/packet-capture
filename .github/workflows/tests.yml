@@ -1,0 +1,39 @@
+# Runs the tests on GitHub's servers for every push and pull request to dev or main.
+# Results show as a check mark or X next to each commit, with the full output in the Actions tab.
+name: Tests
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      # get the repo, including the sample capture the tests read
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          # reuse downloaded packages between runs; the cache resets when pyproject.toml changes
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      # pyshark needs tshark to decode packets. Installing it normally stops to ask whether non-root
+      # users may capture, so answer that first (no; the tests only read files).
+      - name: Install tshark
+        run: |
+          echo "wireshark-common wireshark-common/install-setuid boolean false" | sudo debconf-set-selections
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y tshark
+          tshark --version | head -1
+
+      # pytest and scapy; the tests don't use Streamlit or pandas, so the gui extras are skipped
+      - name: Install the package and test tools
+        run: pip install -e ".[test]"
+
+      - name: Run tests
+        run: pytest -v
