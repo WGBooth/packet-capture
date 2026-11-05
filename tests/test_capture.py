@@ -130,6 +130,10 @@ def write_capture(tmp_path, packets):
     cap.close()
     return result
 
+####################
+####### TCP ########
+####################
+
 def test_generated_tcp_syn(tmp_path):
     syn = Ether() / IP(src="10.0.0.2", dst="10.0.0.1") / TCP(sport=50000, dport=80, flags="S")
     [pkt] = write_capture(tmp_path, [syn])
@@ -266,6 +270,23 @@ def test_generated_tcp_retransmitted_syn(tmp_path):
     assert connection.handshake is True
     assert connection.status == "open"
     assert connection.duration.total_seconds() == pytest.approx(1.2)
+
+def test_generated_tcp_rst_ack_does_not_complete_handshake(tmp_path):
+    client, server = "10.0.0.2", "10.0.0.1"
+    packets = write_capture(tmp_path, [
+        Ether() / IP(src=client, dst=server) / TCP(sport=50004, dport=80, flags="S"),
+        Ether() / IP(src=server, dst=client) / TCP(sport=80, dport=50004, flags="SA"),
+        # the client gives up instead of sending the final ACK; RST-ACK also has ACK set
+        Ether() / IP(src=client, dst=server) / TCP(sport=50004, dport=80, flags="RA"),
+    ])
+    [connection] = ana.tcp_connections(packets)
+    assert connection.handshake is False   # the third step has to be an ACK without RST
+    assert connection.status == "reset"
+    assert ana.tcp_handshake_identifier(packets) == []
+
+####################
+####### DNS ########
+####################
 
 def test_generated_dns_lookup(tmp_path):
     """Generates DNS query and response"""
