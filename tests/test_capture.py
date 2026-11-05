@@ -16,7 +16,7 @@ from scapy.packet import Raw
 from scapy.utils import wrpcap
 import packet_capture.analysis as ana
 from packet_capture.capture import capture_file
-from packet_capture.packet import Packet
+from packet_capture.packet import DNS_RCODES, Packet
 
 CAPTURE = str(Path(__file__).parent / "captures" / "TheUltimateCapture.pcapng")
 
@@ -298,3 +298,69 @@ def test_generated_dns_nxdomain(tmp_path):
     assert (answered.query, answered.rcode) == ("nope.invalid", "NXDOMAIN")
     assert answered.answers == []
     assert ana.failed_dns_lookups(packets) == [(("nope.invalid", "NXDOMAIN"), 1)]
+
+def test_generated_dns_rcode_fallback(tmp_path):
+    """Generates DNS query and response with an unknown rcode (fallback)"""
+    client, resolver = "10.0.0.2", "10.0.0.53"
+    question = DNSQR(qname="other.test", qtype="A")
+    query = Ether() / IP(src=client, dst=resolver) / UDP(sport=40002, dport=53) / DNS(id=3, rd=1, qd=question)
+    # rcode 9 isn't in DNS_RCODES, so DnsInfo falls back to Wireshark's own description
+    response = Ether() / IP(src=resolver, dst=client) / UDP(sport=53, dport=40002) / DNS(id=3, qr=1, rcode=9, qd=question)
+    packets = write_capture(tmp_path, [query, response])
+
+    answered = packets[1].dns
+    assert answered is not None
+    assert answered.rcode is not None # must respond with something
+    assert answered.rcode not in DNS_RCODES.values()
+    assert answered.rcode.endswith("(9)")
+    # any code other than NOERROR counts as a failed lookup
+    assert ana.failed_dns_lookups(packets) == [(("other.test", answered.rcode), 1)]
+
+def test_generated_dns_response_without_query(tmp_path):
+    client, resolver = "10.0.0.2", "10.0.0.53"
+    seen = DNSQR(qname="example.com", qtype="A")
+    missed = DNSQR(qname="example.org", qtype="A")
+    query = Ether() / IP(src=client, dst=resolver) / UDP(sport=40003, dport=53) / DNS(id=4, rd=1, qd=seen)
+    response = (Ether() / IP(src=resolver, dst=client) / UDP(sport=53, dport=40003)
+                / DNS(id=4, qr=1, qd=seen, an=[DNSRR(rrname="example.com", type="A", rdata="192.0.2.10")]))
+    # the query for example.org was sent before the capture started, so only its response is captured
+    orphan = (Ether() / IP(src=resolver, dst=client) / UDP(sport=53, dport=40004)
+              / DNS(id=5, qr=1, qd=missed, an=[DNSRR(rrname="example.org", type="A", rdata="192.0.2.20")]))
+    query.time, response.time, orphan.time = 1_700_000_000, 1_700_000_000.025, 1_700_000_001
+    packets = write_capture(tmp_path, [query, response, orphan])
+
+    assert packets[2].dns is not None
+    assert packets[2].dns.query == "example.org"
+    assert packets[2].dns.response_time is None   # tshark has no query to measure from
+    # only the response whose query was captured has a time; the other is left out, not counted as 0
+    assert ana.dns_response_times(packets) == [pytest.approx(0.025)]
+
+def test_generated_dns_several_lookups(tmp_path):
+    client = "10.0.0.2"
+
+    def lookup(query_id, domain, query_type, server, start, response_time, rcode=0, answer=None):
+        """A query from client to server and its response, response_time seconds later."""
+        question = DNSQR(qname=domain, qtype=query_type)
+        answers = [DNSRR(rrname=domain, type=query_type, rdata=answer)] if answer else []
+        port = 41000 + query_id
+        query = Ether() / IP(src=client, dst=server) / UDP(sport=port, dport=53) / DNS(id=query_id, rd=1, qd=question)
+        response = (Ether() / IP(src=server, dst=client) / UDP(sport=53, dport=port)
+                    / DNS(id=query_id, qr=1, rcode=rcode, qd=question, an=answers))
+        query.time, response.time = 1_700_000_000 + start, 1_700_000_000 + start + response_time
+        return [query, response]
+
+    packets = write_capture(tmp_path,
+        lookup(1, "example.com", "A",    "10.0.0.53", 0.0, 0.025, answer="192.0.2.10")
+        + lookup(2, "example.com", "AAAA", "10.0.0.53", 0.1, 0.040, answer="2001:db8::10")
+        + lookup(3, "example.org", "A",    "10.0.0.54", 0.2, 0.030, answer="192.0.2.20")   # a second DNS server
+        + lookup(4, "broken.test", "A",    "10.0.0.53", 0.3, 0.050, rcode=2)               # rcode 2 is SERVFAIL
+    )
+
+    # counted from the queries: example.com twice (A and AAAA), the others once, in the order first seen
+    assert ana.top_domains(packets) == [("example.com", 2), ("example.org", 1), ("broken.test", 1)]
+    assert ana.dns_query_types(packets) == {"A": 3, "AAAA": 1}
+    assert ana.dns_servers(packets) == [("10.0.0.53", 3), ("10.0.0.54", 1)]
+    assert ana.dns_response_times(packets) == pytest.approx([0.025, 0.040, 0.030, 0.050])
+    assert ana.failed_dns_lookups(packets) == [(("broken.test", "SERVFAIL"), 1)]
+    assert packets[3].dns is not None
+    assert packets[3].dns.answers == ["2001:db8::10"]   # an IPv6 (AAAA) answer
