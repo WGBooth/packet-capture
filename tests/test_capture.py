@@ -197,3 +197,71 @@ def test_generated_tcp_refused(tmp_path):
     assert connection.packets == 2
     assert connection.handshake is False   # the SYN-ACK never came
     assert connection.status == "reset"
+
+def test_generated_tcp_started_before_capture(tmp_path):
+    """TCP connection where capture starts after the handshake"""
+    client, server = "10.0.0.2", "10.0.0.1"
+    packets = write_capture(tmp_path, [
+        # no handshake: the capture starts partway through, with the server sending first
+        Ether() / IP(src=server, dst=client) / TCP(sport=22, dport=50002, flags="PA") / Raw(b"z" * 50),
+        Ether() / IP(src=client, dst=server) / TCP(sport=50002, dport=22, flags="A"),
+    ])
+    [connection] = ana.tcp_connections(packets)
+    # without a SYN, the side with the lower port (22) is taken as the server
+    assert (connection.client, connection.client_port) == (client, "50002")
+    assert (connection.server, connection.server_port) == (server, "22")
+    assert connection.bytes_from_server == 54 + 50
+    assert connection.bytes_from_client == 54
+    assert connection.handshake is False   # it happened before the capture started
+    assert connection.status == "open"
+
+def test_generated_tcp_port_reused(tmp_path):
+    client, server = "10.0.0.2", "10.0.0.1"
+    to_server = Ether() / IP(src=client, dst=server)
+    to_client = Ether() / IP(src=server, dst=client)
+
+    def short_connection():
+        """A handshake and close from client:50000 to server:80, no data."""
+        return [
+            to_server / TCP(sport=50000, dport=80, flags="S"),
+            to_client / TCP(sport=80, dport=50000, flags="SA"),
+            to_server / TCP(sport=50000, dport=80, flags="A"),
+            to_server / TCP(sport=50000, dport=80, flags="FA"),
+            to_client / TCP(sport=80, dport=50000, flags="FA"),
+            to_server / TCP(sport=50000, dport=80, flags="A"),
+        ]
+
+    # the same client port used twice, one connection after the other
+    generated = short_connection()
+    generated += short_connection()
+    for i, packet in enumerate(generated):
+        packet.time = 1_700_000_000 + i * 0.1
+    first, second = ana.tcp_connections(write_capture(tmp_path, generated))
+
+    # the second SYN comes after the first connection closed, so it starts a new connection
+    assert first.client_port == second.client_port == "50000"
+    assert first.packets == second.packets == 6
+    assert first.handshake and second.handshake
+    assert first.status == second.status == "closed"
+    assert second.start > first.end
+
+
+def test_generated_tcp_retransmitted_syn(tmp_path):
+    client, server = "10.0.0.2", "10.0.0.1"
+    to_server = Ether() / IP(src=client, dst=server)
+    to_client = Ether() / IP(src=server, dst=client)
+    generated = [
+        to_server / TCP(sport=50000, dport=80, flags="S"),    # first try, no answer
+        to_server / TCP(sport=50000, dport=80, flags="S"),    # the client tries again
+        to_client / TCP(sport=80, dport=50000, flags="SA"),
+        to_server / TCP(sport=50000, dport=80, flags="A"),
+    ]
+    # the retry comes 1 second after the first SYN, then the rest follow quickly
+    for packet, seconds in zip(generated, [0.0, 1.0, 1.1, 1.2]):
+        packet.time = 1_700_000_000 + seconds
+    # the handshake hadn't finished when the second SYN came, so it's the same connection
+    [connection] = ana.tcp_connections(write_capture(tmp_path, generated))
+    assert connection.packets == 4
+    assert connection.handshake is True
+    assert connection.status == "open"
+    assert connection.duration.total_seconds() == pytest.approx(1.2)
