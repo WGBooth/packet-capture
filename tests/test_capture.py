@@ -9,7 +9,8 @@ capture[i] is frame i + 1: the list starts at 0, but Wireshark numbers frames fr
 from pathlib import Path
 import pytest
 # imported from where each is defined; scapy.all builds its names at runtime, so Pylance can't see them
-from scapy.layers.inet import IP, TCP
+from scapy.layers.dns import DNS, DNSQR, DNSRR
+from scapy.layers.inet import IP, TCP, UDP
 from scapy.layers.l2 import Ether
 from scapy.packet import Raw
 from scapy.utils import wrpcap
@@ -265,3 +266,35 @@ def test_generated_tcp_retransmitted_syn(tmp_path):
     assert connection.handshake is True
     assert connection.status == "open"
     assert connection.duration.total_seconds() == pytest.approx(1.2)
+
+def test_generated_dns_lookup(tmp_path):
+    """Generates DNS query and response"""
+    client, resolver = "10.0.0.2", "10.0.0.53"
+    question = DNSQR(qname="example.com", qtype="A")
+    query = Ether() / IP(src=client, dst=resolver) / UDP(sport=40000, dport=53) / DNS(id=1, rd=1, qd=question)
+    response = (Ether() / IP(src=resolver, dst=client) / UDP(sport=53, dport=40000)
+                / DNS(id=1, qr=1, qd=question, an=[DNSRR(rrname="example.com", type="A", rdata="192.0.2.10")]))
+    query.time, response.time = 1_700_000_000, 1_700_000_000.025   # the response comes 25 ms after the query
+    packets = write_capture(tmp_path, [query, response])
+
+    assert packets[0].dns is not None and packets[1].dns is not None
+    asked, answered = packets[0].dns, packets[1].dns
+    assert (asked.query, asked.query_type, asked.is_response) == ("example.com", "A", False)
+    assert (answered.query, answered.is_response, answered.rcode) == ("example.com", True, "NOERROR")
+    assert answered.answers == ["192.0.2.10"]
+    assert answered.response_time == pytest.approx(0.025)
+
+def test_generated_dns_nxdomain(tmp_path):
+    """Generates DNS query and NXDOMAIN response (no domain)"""
+    client, resolver = "10.0.0.2", "10.0.0.53"
+    question = DNSQR(qname="nope.invalid", qtype="A")   # .invalid names are guaranteed not to exist
+    query = Ether() / IP(src=client, dst=resolver) / UDP(sport=40001, dport=53) / DNS(id=2, rd=1, qd=question)
+    # rcode 3 is NXDOMAIN: no such domain, so there are no answers
+    response = Ether() / IP(src=resolver, dst=client) / UDP(sport=53, dport=40001) / DNS(id=2, qr=1, rcode=3, qd=question)
+    packets = write_capture(tmp_path, [query, response])
+
+    answered = packets[1].dns
+    assert answered is not None
+    assert (answered.query, answered.rcode) == ("nope.invalid", "NXDOMAIN")
+    assert answered.answers == []
+    assert ana.failed_dns_lookups(packets) == [(("nope.invalid", "NXDOMAIN"), 1)]
