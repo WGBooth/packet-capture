@@ -11,6 +11,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       # get the repo, including the sample capture the tests read
       - uses: actions/checkout@v4
