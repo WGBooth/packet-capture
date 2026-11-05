@@ -8,8 +8,15 @@ capture[i] is frame i + 1: the list starts at 0, but Wireshark numbers frames fr
 
 from pathlib import Path
 import pytest
+# imported from where each is defined; scapy.all builds its names at runtime, so Pylance can't see them
+from scapy.layers.dns import DNS, DNSQR, DNSRR
+from scapy.layers.inet import IP, TCP, UDP
+from scapy.layers.l2 import Ether
+from scapy.packet import Raw
+from scapy.utils import wrpcap
+import packet_capture.analysis as ana
 from packet_capture.capture import capture_file
-from packet_capture.packet import Packet
+from packet_capture.packet import DNS_RCODES, Packet
 
 CAPTURE = str(Path(__file__).parent / "captures" / "TheUltimateCapture.pcapng")
 
@@ -109,3 +116,272 @@ def test_live_network_capture():
 @pytest.mark.skip(reason="TODO")
 def test_remote_capture():
     ...
+
+# ---- Generated traffic (Scapy) ----
+# Packets built with Scapy, so the expected values are worked out from what was generated,
+# not looked up in a capture.
+
+def write_capture(tmp_path, packets):
+    """Writes Scapy packets to a .pcap in tmp_path and reads them back as Packet objects."""
+    path = str(tmp_path / "generated.pcap")
+    wrpcap(path, packets)
+    cap = capture_file(path)
+    result = [Packet(raw_packet) for raw_packet in cap]
+    cap.close()
+    return result
+
+####################
+####### TCP ########
+####################
+
+def test_generated_tcp_syn(tmp_path):
+    syn = Ether() / IP(src="10.0.0.2", dst="10.0.0.1") / TCP(sport=50000, dport=80, flags="S")
+    [pkt] = write_capture(tmp_path, [syn])
+    assert (pkt.src, pkt.dst) == ("10.0.0.2", "10.0.0.1")
+    assert (pkt.src_port, pkt.dst_port) == ("50000", "80")
+    assert pkt.transport == "TCP"
+    assert pkt.flags == ["SYN"]
+    assert pkt.length == 54   # Ethernet (14) + IP (20) + TCP (20) headers, no data
+
+def test_generated_packet_with_two_flags(tmp_path):
+    syn_ack = Ether() / IP(src="10.0.0.1", dst="10.0.0.2") / TCP(sport=80, dport=50000, flags="SA")
+    [pkt] = write_capture(tmp_path, [syn_ack])
+    assert pkt.flags == ["SYN", "ACK"]   # Scapy's "SA"; tshark flags as 0x012 (SYN 0x02, ACK 0x10)
+
+def test_generated_tcp_handshake(tmp_path):
+    client, server = "10.0.0.2", "10.0.0.1"
+    packets = write_capture(tmp_path, [
+        Ether() / IP(src=client, dst=server) / TCP(sport=50000, dport=80, flags="S"),
+        Ether() / IP(src=server, dst=client) / TCP(sport=80, dport=50000, flags="SA"),
+        Ether() / IP(src=client, dst=server) / TCP(sport=50000, dport=80, flags="A"),
+    ])
+    [connection] = ana.tcp_connections(packets)
+    assert (connection.client, connection.client_port) == (client, "50000")
+    assert (connection.server, connection.server_port) == (server, "80")
+    assert connection.packets == 3
+    assert connection.handshake is True
+    assert connection.status == "open"   # not closed yet
+    assert ana.tcp_handshake_identifier(packets) == [(client, server)]
+
+def test_generated_tcp_graceful_close(tmp_path):
+    client, server = "10.0.0.2", "10.0.0.1"
+    to_server = Ether() / IP(src=client, dst=server)
+    to_client = Ether() / IP(src=server, dst=client)
+    generated = [
+        to_server / TCP(sport=50000, dport=80, flags="S"),                     # handshake
+        to_client / TCP(sport=80, dport=50000, flags="SA"),
+        to_server / TCP(sport=50000, dport=80, flags="A"),
+        to_server / TCP(sport=50000, dport=80, flags="PA") / Raw(b"x" * 100),  # 100 bytes of data up
+        to_client / TCP(sport=80, dport=50000, flags="PA") / Raw(b"y" * 500),  # 500 bytes of data down
+        to_server / TCP(sport=50000, dport=80, flags="FA"),                    # client closes
+        to_client / TCP(sport=80, dport=50000, flags="FA"),                    # server closes
+        to_server / TCP(sport=50000, dport=80, flags="A"),                     # client acknowledges
+    ]
+    # one packet every 0.1 seconds, so the connection lasts 0.7 seconds
+    for i, packet in enumerate(generated):
+        packet.time = 1_700_000_000 + i * 0.1
+    [connection] = ana.tcp_connections(write_capture(tmp_path, generated))
+    assert connection.packets == 8
+    # paket times 54 bytes of headers plus data length of raw bytes
+    assert connection.bytes_from_client == 5 * 54 + 100
+    assert connection.bytes_from_server == 3 * 54 + 500
+    assert connection.duration.total_seconds() == pytest.approx(0.7)
+    assert connection.handshake is True
+    assert connection.status == "closed"
+
+def test_generated_tcp_refused(tmp_path):
+    """TCP connection refused because server is not listening on port 8080, but on 80"""
+    client, server = "10.0.0.2", "10.0.0.1"
+    packets = write_capture(tmp_path, [
+        Ether() / IP(src=client, dst=server) / TCP(sport=50001, dport=8080, flags="S"),
+        Ether() / IP(src=server, dst=client) / TCP(sport=8080, dport=50001, flags="RA"),
+    ])
+    assert packets[1].flags == ["RST", "ACK"]
+    [connection] = ana.tcp_connections(packets)
+    assert (connection.client, connection.server_port) == (client, "8080")
+    assert connection.packets == 2
+    assert connection.handshake is False   # the SYN-ACK never came
+    assert connection.status == "reset"
+
+def test_generated_tcp_started_before_capture(tmp_path):
+    """TCP connection where capture starts after the handshake"""
+    client, server = "10.0.0.2", "10.0.0.1"
+    packets = write_capture(tmp_path, [
+        # no handshake: the capture starts partway through, with the server sending first
+        Ether() / IP(src=server, dst=client) / TCP(sport=22, dport=50002, flags="PA") / Raw(b"z" * 50),
+        Ether() / IP(src=client, dst=server) / TCP(sport=50002, dport=22, flags="A"),
+    ])
+    [connection] = ana.tcp_connections(packets)
+    # without a SYN, the side with the lower port (22) is taken as the server
+    assert (connection.client, connection.client_port) == (client, "50002")
+    assert (connection.server, connection.server_port) == (server, "22")
+    assert connection.bytes_from_server == 54 + 50
+    assert connection.bytes_from_client == 54
+    assert connection.handshake is False   # it happened before the capture started
+    assert connection.status == "open"
+
+def test_generated_tcp_port_reused(tmp_path):
+    client, server = "10.0.0.2", "10.0.0.1"
+    to_server = Ether() / IP(src=client, dst=server)
+    to_client = Ether() / IP(src=server, dst=client)
+
+    def short_connection():
+        """A handshake and close from client:50000 to server:80, no data."""
+        return [
+            to_server / TCP(sport=50000, dport=80, flags="S"),
+            to_client / TCP(sport=80, dport=50000, flags="SA"),
+            to_server / TCP(sport=50000, dport=80, flags="A"),
+            to_server / TCP(sport=50000, dport=80, flags="FA"),
+            to_client / TCP(sport=80, dport=50000, flags="FA"),
+            to_server / TCP(sport=50000, dport=80, flags="A"),
+        ]
+
+    # the same client port used twice, one connection after the other
+    generated = short_connection()
+    generated += short_connection()
+    for i, packet in enumerate(generated):
+        packet.time = 1_700_000_000 + i * 0.1
+    first, second = ana.tcp_connections(write_capture(tmp_path, generated))
+
+    # the second SYN comes after the first connection closed, so it starts a new connection
+    assert first.client_port == second.client_port == "50000"
+    assert first.packets == second.packets == 6
+    assert first.handshake and second.handshake
+    assert first.status == second.status == "closed"
+    assert second.start > first.end
+
+
+def test_generated_tcp_retransmitted_syn(tmp_path):
+    client, server = "10.0.0.2", "10.0.0.1"
+    to_server = Ether() / IP(src=client, dst=server)
+    to_client = Ether() / IP(src=server, dst=client)
+    generated = [
+        to_server / TCP(sport=50000, dport=80, flags="S"),    # first try, no answer
+        to_server / TCP(sport=50000, dport=80, flags="S"),    # the client tries again
+        to_client / TCP(sport=80, dport=50000, flags="SA"),
+        to_server / TCP(sport=50000, dport=80, flags="A"),
+    ]
+    # the retry comes 1 second after the first SYN, then the rest follow quickly
+    for packet, seconds in zip(generated, [0.0, 1.0, 1.1, 1.2]):
+        packet.time = 1_700_000_000 + seconds
+    # the handshake hadn't finished when the second SYN came, so it's the same connection
+    [connection] = ana.tcp_connections(write_capture(tmp_path, generated))
+    assert connection.packets == 4
+    assert connection.handshake is True
+    assert connection.status == "open"
+    assert connection.duration.total_seconds() == pytest.approx(1.2)
+
+def test_generated_tcp_rst_ack_does_not_complete_handshake(tmp_path):
+    client, server = "10.0.0.2", "10.0.0.1"
+    packets = write_capture(tmp_path, [
+        Ether() / IP(src=client, dst=server) / TCP(sport=50004, dport=80, flags="S"),
+        Ether() / IP(src=server, dst=client) / TCP(sport=80, dport=50004, flags="SA"),
+        # the client gives up instead of sending the final ACK; RST-ACK also has ACK set
+        Ether() / IP(src=client, dst=server) / TCP(sport=50004, dport=80, flags="RA"),
+    ])
+    [connection] = ana.tcp_connections(packets)
+    assert connection.handshake is False   # the third step has to be an ACK without RST
+    assert connection.status == "reset"
+    assert ana.tcp_handshake_identifier(packets) == []
+
+####################
+####### DNS ########
+####################
+
+def test_generated_dns_lookup(tmp_path):
+    """Generates DNS query and response"""
+    client, resolver = "10.0.0.2", "10.0.0.53"
+    question = DNSQR(qname="example.com", qtype="A")
+    query = Ether() / IP(src=client, dst=resolver) / UDP(sport=40000, dport=53) / DNS(id=1, rd=1, qd=question)
+    response = (Ether() / IP(src=resolver, dst=client) / UDP(sport=53, dport=40000)
+                / DNS(id=1, qr=1, qd=question, an=[DNSRR(rrname="example.com", type="A", rdata="192.0.2.10")]))
+    query.time, response.time = 1_700_000_000, 1_700_000_000.025   # the response comes 25 ms after the query
+    packets = write_capture(tmp_path, [query, response])
+
+    assert packets[0].dns is not None and packets[1].dns is not None
+    asked, answered = packets[0].dns, packets[1].dns
+    assert (asked.query, asked.query_type, asked.is_response) == ("example.com", "A", False)
+    assert (answered.query, answered.is_response, answered.rcode) == ("example.com", True, "NOERROR")
+    assert answered.answers == ["192.0.2.10"]
+    assert answered.response_time == pytest.approx(0.025)
+
+def test_generated_dns_nxdomain(tmp_path):
+    """Generates DNS query and NXDOMAIN response (no domain)"""
+    client, resolver = "10.0.0.2", "10.0.0.53"
+    question = DNSQR(qname="nope.invalid", qtype="A")   # .invalid names are guaranteed not to exist
+    query = Ether() / IP(src=client, dst=resolver) / UDP(sport=40001, dport=53) / DNS(id=2, rd=1, qd=question)
+    # rcode 3 is NXDOMAIN: no such domain, so there are no answers
+    response = Ether() / IP(src=resolver, dst=client) / UDP(sport=53, dport=40001) / DNS(id=2, qr=1, rcode=3, qd=question)
+    packets = write_capture(tmp_path, [query, response])
+
+    answered = packets[1].dns
+    assert answered is not None
+    assert (answered.query, answered.rcode) == ("nope.invalid", "NXDOMAIN")
+    assert answered.answers == []
+    assert ana.failed_dns_lookups(packets) == [(("nope.invalid", "NXDOMAIN"), 1)]
+
+def test_generated_dns_rcode_fallback(tmp_path):
+    """Generates DNS query and response with an unknown rcode (fallback)"""
+    client, resolver = "10.0.0.2", "10.0.0.53"
+    question = DNSQR(qname="other.test", qtype="A")
+    query = Ether() / IP(src=client, dst=resolver) / UDP(sport=40002, dport=53) / DNS(id=3, rd=1, qd=question)
+    # rcode 9 isn't in DNS_RCODES, so DnsInfo falls back to Wireshark's own description
+    response = Ether() / IP(src=resolver, dst=client) / UDP(sport=53, dport=40002) / DNS(id=3, qr=1, rcode=9, qd=question)
+    packets = write_capture(tmp_path, [query, response])
+
+    answered = packets[1].dns
+    assert answered is not None
+    assert answered.rcode is not None # must respond with something
+    assert answered.rcode not in DNS_RCODES.values()
+    assert answered.rcode.endswith("(9)")
+    # any code other than NOERROR counts as a failed lookup
+    assert ana.failed_dns_lookups(packets) == [(("other.test", answered.rcode), 1)]
+
+def test_generated_dns_response_without_query(tmp_path):
+    client, resolver = "10.0.0.2", "10.0.0.53"
+    seen = DNSQR(qname="example.com", qtype="A")
+    missed = DNSQR(qname="example.org", qtype="A")
+    query = Ether() / IP(src=client, dst=resolver) / UDP(sport=40003, dport=53) / DNS(id=4, rd=1, qd=seen)
+    response = (Ether() / IP(src=resolver, dst=client) / UDP(sport=53, dport=40003)
+                / DNS(id=4, qr=1, qd=seen, an=[DNSRR(rrname="example.com", type="A", rdata="192.0.2.10")]))
+    # the query for example.org was sent before the capture started, so only its response is captured
+    orphan = (Ether() / IP(src=resolver, dst=client) / UDP(sport=53, dport=40004)
+              / DNS(id=5, qr=1, qd=missed, an=[DNSRR(rrname="example.org", type="A", rdata="192.0.2.20")]))
+    query.time, response.time, orphan.time = 1_700_000_000, 1_700_000_000.025, 1_700_000_001
+    packets = write_capture(tmp_path, [query, response, orphan])
+
+    assert packets[2].dns is not None
+    assert packets[2].dns.query == "example.org"
+    assert packets[2].dns.response_time is None   # tshark has no query to measure from
+    # only the response whose query was captured has a time; the other is left out, not counted as 0
+    assert ana.dns_response_times(packets) == [pytest.approx(0.025)]
+
+def test_generated_dns_several_lookups(tmp_path):
+    client = "10.0.0.2"
+
+    def lookup(query_id, domain, query_type, server, start, response_time, rcode=0, answer=None):
+        """A query from client to server and its response, response_time seconds later."""
+        question = DNSQR(qname=domain, qtype=query_type)
+        answers = [DNSRR(rrname=domain, type=query_type, rdata=answer)] if answer else []
+        port = 41000 + query_id
+        query = Ether() / IP(src=client, dst=server) / UDP(sport=port, dport=53) / DNS(id=query_id, rd=1, qd=question)
+        response = (Ether() / IP(src=server, dst=client) / UDP(sport=53, dport=port)
+                    / DNS(id=query_id, qr=1, rcode=rcode, qd=question, an=answers))
+        query.time, response.time = 1_700_000_000 + start, 1_700_000_000 + start + response_time
+        return [query, response]
+
+    packets = write_capture(tmp_path,
+        lookup(1, "example.com", "A",    "10.0.0.53", 0.0, 0.025, answer="192.0.2.10")
+        + lookup(2, "example.com", "AAAA", "10.0.0.53", 0.1, 0.040, answer="2001:db8::10")
+        + lookup(3, "example.org", "A",    "10.0.0.54", 0.2, 0.030, answer="192.0.2.20")   # a second DNS server
+        + lookup(4, "broken.test", "A",    "10.0.0.53", 0.3, 0.050, rcode=2)               # rcode 2 is SERVFAIL
+    )
+
+    # counted from the queries: example.com twice (A and AAAA), the others once, in the order first seen
+    assert ana.top_domains(packets) == [("example.com", 2), ("example.org", 1), ("broken.test", 1)]
+    assert ana.dns_query_types(packets) == {"A": 3, "AAAA": 1}
+    assert ana.dns_servers(packets) == [("10.0.0.53", 3), ("10.0.0.54", 1)]
+    assert ana.dns_response_times(packets) == pytest.approx([0.025, 0.040, 0.030, 0.050])
+    assert ana.failed_dns_lookups(packets) == [(("broken.test", "SERVFAIL"), 1)]
+    assert packets[3].dns is not None
+    assert packets[3].dns.answers == ["2001:db8::10"]   # an IPv6 (AAAA) answer

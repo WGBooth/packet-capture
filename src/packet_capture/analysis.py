@@ -334,8 +334,8 @@ def tcp_handshake_identifier(packets):
             # server -> client, so the connection is this packet's reverse
             if reverse in syn_packets:
                 syn_ack_packets[reverse] = packet
-        elif 'ACK' in packet.flags:
-            # client -> server, completing the handshake
+        elif 'ACK' in packet.flags and 'RST' not in packet.flags:
+            # client -> server, completing the handshake (an RST-ACK has ACK set too, but it aborts instead)
             if conn in syn_ack_packets:
                 handshakes.append((packet.src, packet.dst))
                 # Remove the packets from the dictionaries to avoid counting them again
@@ -430,7 +430,8 @@ def tcp_connections(packets):
             connection.syn_seen = True
         elif is_syn_ack and not from_client and connection.syn_seen:
             connection.syn_ack_seen = True
-        elif 'ACK' in packet.flags and from_client and connection.syn_ack_seen:
+        # (an RST-ACK has ACK set too, but it aborts the connection instead of completing it)
+        elif 'ACK' in packet.flags and 'RST' not in packet.flags and from_client and connection.syn_ack_seen:
             connection.handshake = True
 
         # RST wins: it marks the connection reset even after a FIN, and a later FIN doesn't undo it
