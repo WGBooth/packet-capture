@@ -12,6 +12,7 @@ from scapy.layers.dns import DNS, DNSQR
 from scapy.layers.l2 import ARP, Ether
 from scapy.packet import Raw
 from scapy.utils import wrpcap
+from datetime import date, datetime
 
 OUTPUT = Path(__file__).parent.parent / "tests" / "captures" / "generated"
 START = 1_700_000_000   # timestamp of the first packet in each capture
@@ -66,6 +67,22 @@ def dns_request():
     packet.time = START
     return [packet]
 
+def http_packets_send():
+    """
+    An HTTP GET request from 10.0.0.2 to 10.0.0.1 for the path "/".
+
+    Wireshark:
+        - 2 packets, HTTP GET, POST 
+        - Analyze > Expert Information: no warnings or errors
+    App (HTTP tab): 1 request, top path "/"
+    """
+    client, server = "10.0.0.2", "10.0.0.1"
+    packet = Ether() / IP(src=client, dst=server) / TCP(sport=12345, dport=80, flags="S", seq=1000)
+    packet = packet / Raw(b"GET / HTTP/1.1\r\nHost: 10.0.0.1\r\n\r\n")
+    packet = packet / Raw(b"POST / HTTP/1.1\r\nHost: 10.0.0.1\r\nContent-Length: 55\r\n\r\nI hope no one can read this. That would be embarrassing!")
+    packet.time = START
+    return [packet]
+
 def arp_request():
     """
     An ARP request from 10.0.0.2 asking for the MAC address of 10.0.0.1.
@@ -80,7 +97,7 @@ def arp_request():
     packet.time = START
     return [packet]
 
-SCENARIOS = [graceful_tcp_close, dns_request, arp_request]
+SCENARIOS = [graceful_tcp_close, dns_request, arp_request, http_packets_send]
 
 def main():
     """Writes each scenario to OUTPUT/<name>.pcap and prints where it went and what to expect."""
