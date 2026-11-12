@@ -102,9 +102,11 @@ class Packet:
         self.length = int(raw_packet.length)
 
         # TCP flags that are set (e.g., ['SYN', 'ACK']), or an empty list for non-TCP packets
-        if 'TCP' in raw_packet:
+        # and for TCP packets cut off before the flags
+        flags = raw_packet.tcp.get_field('flags') if 'TCP' in raw_packet else None
+        if flags is not None:
             # tshark gives flags as a hex string, e.g. "0x0012" for SYN+ACK
-            bits = int(raw_packet.tcp.flags, 16)
+            bits = int(flags, 16)
             self.flags = [name for name, mask in TCP_FLAGS if bits & mask]
         else:
             self.flags = []
@@ -112,5 +114,9 @@ class Packet:
         # DNS query or response details, or None for packets without DNS
         self.dns = DnsInfo.from_pyshark(raw_packet.dns) if 'DNS' in raw_packet else None
 
+        # True if tshark couldn't fully decode the packet (e.g., cut off partway through a header);
+        # tshark then adds a "_ws.malformed" layer
+        self.bad_packet = '_WS.MALFORMED' in raw_packet
+
     def __repr__(self):
-        return f"Packet(timestamp={self.timestamp}, src={self.src}, dst={self.dst}, protocol={self.protocol}, transport={self.transport}, src_port={self.src_port}, dst_port={self.dst_port}, length={self.length}, flags={self.flags}, dns={self.dns})"
+        return f"Packet(timestamp={self.timestamp}, src={self.src}, dst={self.dst}, protocol={self.protocol}, transport={self.transport}, src_port={self.src_port}, dst_port={self.dst_port}, length={self.length}, flags={self.flags}, dns={self.dns}, bad_packet={self.bad_packet})"
