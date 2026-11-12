@@ -3,7 +3,12 @@ Filename: make_captures.py
 Description: Generates synthetic traffic (Scapy) to .pcap files in tests/captures/generated/. View in Wireshark
 and in the terminal for comparison purposes.
 Usage: python(3) scripts/make_captures.py
+       python(3) scripts/make_captures.py --send   (loopback, lo0, during a live capture)
 """
+
+import logging
+import sys
+import time
 from pathlib import Path
 
 # imported from the modules that define them, not scapy.all, so editors can find the names
@@ -11,8 +16,8 @@ from scapy.layers.inet import IP, TCP, UDP
 from scapy.layers.dns import DNS, DNSQR
 from scapy.layers.l2 import ARP, Ether
 from scapy.packet import Raw
+from scapy.sendrecv import send
 from scapy.utils import wrpcap
-from datetime import date, datetime
 
 OUTPUT = Path(__file__).parent.parent / "tests" / "captures" / "generated"
 START = 1_700_000_000   # timestamp of the first packet in each capture
@@ -97,10 +102,36 @@ def arp_request():
     packet.time = START
     return [packet]
 
+def send_scenarios():
+    """
+    Sends each scenario on loopback (lo0), to capture live. Compared to the .pcap files:
+        - Each packet is 10 bytes shorter: loopback has a 4-byte header instead of the 14-byte Ethernet one
+        - Non-IP scenarios (ARP) are skipped, since loopback has no Ethernet layer to carry them
+        - The 10.0.0.x addresses aren't this computer's, so it ignores the packets instead of answering them
+    """
+    # Scapy warns "No route found" for 10.0.0.x, which doesn't matter since the interface is given
+    logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
+    for scenario in SCENARIOS:
+        packets = scenario()
+        if not all(IP in packet for packet in packets):
+            print(f"{scenario.__name__}: skipped (not IP)")
+            continue
+        for i, packet in enumerate(packets):
+            # send() doesn't use packet.time, so wait the same gap as in the .pcap
+            if i > 0:
+                time.sleep(float(packet.time) - float(packets[i - 1].time))
+            # packet[IP] drops the Ethernet header; Scapy adds the loopback one
+            send(packet[IP], iface="lo0", verbose=False)
+        print(f"{scenario.__name__}: sent {len(packets)} packets")
+
+
 SCENARIOS = [graceful_tcp_close, dns_request, arp_request, http_packets_send]
 
 def main():
     """Writes each scenario to OUTPUT/<name>.pcap and prints where it went and what to expect."""
+    if "--send" in sys.argv:
+        send_scenarios()
+        return
     OUTPUT.mkdir(parents=True, exist_ok=True)
     for scenario in SCENARIOS:
         path = OUTPUT / f"{scenario.__name__}.pcap"
