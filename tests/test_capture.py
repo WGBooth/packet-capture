@@ -385,3 +385,21 @@ def test_generated_dns_several_lookups(tmp_path):
     assert ana.failed_dns_lookups(packets) == [(("broken.test", "SERVFAIL"), 1)]
     assert packets[3].dns is not None
     assert packets[3].dns.answers == ["2001:db8::10"]   # an IPv6 (AAAA) answer
+
+######################
+#### Bad Packets #####
+######################
+
+def test_generated_tcp_truncated_header(tmp_path):
+    """TCP header cut to 10 of its 20 bytes: tshark reads the ports but not the flags"""
+    whole = Ether() / IP(src="10.0.0.2", dst="10.0.0.1") / TCP(sport=50000, dport=80, flags="S")
+    # keep Ethernet (14) + IP (20) + the first 10 bytes of TCP
+    truncated = Ether(bytes(whole)[:14 + 20 + 10])
+    [pkt] = write_capture(tmp_path, [truncated])
+    assert pkt.bad_packet is True
+    # what tshark could read is kept
+    assert (pkt.src, pkt.dst) == ("10.0.0.2", "10.0.0.1")
+    assert (pkt.src_port, pkt.dst_port) == ("50000", "80")
+    assert pkt.transport == "TCP"
+    # the flags are past the cut, so none are known
+    assert pkt.flags == []
