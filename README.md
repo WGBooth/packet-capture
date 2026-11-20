@@ -17,6 +17,8 @@ After a capture, you can filter the packets by protocol, IP address, and port, a
 - **DNS**: queries and responses, failed lookups (e.g. domains that don't exist), median response time, top domains, query types, and DNS servers
 - **TCP**: connections with their handshakes and how they ended (closed with FIN, reset with RST, or still open), top server ports, and a table of every connection with its duration and bytes each way
 
+See [docs/networking_concepts.md](docs/networking_concepts.md) for the networking concepts behind the project.
+
 ## Requirements
 - Python 3.11
 - [Wireshark](https://www.wireshark.org/), which provides `tshark` (pyshark uses it to decode packets)
@@ -55,6 +57,10 @@ tests/
     test_analysis.py    Unit tests for the analysis functions, using hand-built packets
     test_capture.py     Tests reading known frames from the sample capture
     captures/           Sample capture used by the tests
+scripts/
+    make_captures.py    Generates test traffic to .pcap files, or sends it over loopback (--send)
+docs/
+    networking_concepts.md    Networking concepts behind the project
 ```
 
 ## Technologies
