@@ -385,3 +385,36 @@ def test_generated_dns_several_lookups(tmp_path):
     assert ana.failed_dns_lookups(packets) == [(("broken.test", "SERVFAIL"), 1)]
     assert packets[3].dns is not None
     assert packets[3].dns.answers == ["2001:db8::10"]   # an IPv6 (AAAA) answer
+
+######################
+#### Bad Packets #####
+######################
+
+def test_generated_tcp_truncated_header(tmp_path):
+    """TCP header cut to 10 of its 20 bytes: tshark reads the ports but not the flags"""
+    whole = Ether() / IP(src="10.0.0.2", dst="10.0.0.1") / TCP(sport=50000, dport=80, flags="S")
+    # keep Ethernet (14) + IP (20) + the first 10 bytes of TCP
+    truncated = Ether(bytes(whole)[:14 + 20 + 10])
+    [pkt] = write_capture(tmp_path, [truncated])
+    assert pkt.bad_packet is True
+    # what tshark could read is kept
+    assert (pkt.src, pkt.dst) == ("10.0.0.2", "10.0.0.1")
+    assert (pkt.src_port, pkt.dst_port) == ("50000", "80")
+    assert pkt.transport == "TCP"
+    # the flags are past the cut, so none are known
+    assert pkt.flags == []
+
+def test_generated_tcp_bogus_header_length(tmp_path):
+    """
+    TCP header length (data offset) of 16 bytes, below the 20-byte minimum. tshark doesn't call it
+    malformed; it reports an Expert Info error ("Bogus TCP header length") and stops reading the header.
+    """
+    # dataofs counts 4-byte words, so 4 is 16 bytes
+    bogus = Ether() / IP(src="10.0.0.2", dst="10.0.0.1") / TCP(sport=50000, dport=80, flags="S", dataofs=4)
+    [pkt] = write_capture(tmp_path, [bogus])
+    assert pkt.bad_packet is True
+    assert (pkt.src, pkt.dst) == ("10.0.0.2", "10.0.0.1")
+    assert (pkt.src_port, pkt.dst_port) == ("50000", "80")
+    assert pkt.transport == "TCP"
+    # tshark stops before the flags, so none are known
+    assert pkt.flags == []
