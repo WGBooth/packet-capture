@@ -28,6 +28,23 @@ Refused - 5 - Query refused - The server refused to answer for policy reasons
 """
 DNS_RCODES = {0: "NOERROR", 1: "FORMERR", 2: "SERVFAIL", 3: "NXDOMAIN", 4: "NOTIMP", 5: "REFUSED"}
 
+"""
+# Expert Info severities #
+-- Wireshark: Analyze > Expert Information --
+https://www.wireshark.org/docs/wsug_html_chunked/ChAdvExpert.html
+"""
+EXPERT_ERROR = 0x00800000
+
+def has_expert_error(raw_packet):
+    """True if tshark reported an Expert Info error on any layer of the packet"""
+    for layer in raw_packet.layers:
+        severities = layer.get_field("_ws_expert_severity")
+        # a layer can have several Expert Info entries, e.g. Chat and Note on a retransmitted SYN
+        if severities is not None and any(int(severity.get_default_value()) == EXPERT_ERROR
+                                          for severity in severities.all_fields):
+            return True
+    return False
+
 @dataclass
 class DnsInfo:
     """
@@ -114,9 +131,10 @@ class Packet:
         # DNS query or response details, or None for packets without DNS
         self.dns = DnsInfo.from_pyshark(raw_packet.dns) if 'DNS' in raw_packet else None
 
-        # True if tshark couldn't fully decode the packet (e.g., cut off partway through a header);
-        # tshark then adds a "_ws.malformed" layer
-        self.bad_packet = '_WS.MALFORMED' in raw_packet
+        # True if tshark couldn't fully decode the packet: it adds a "_ws.malformed" layer when the packet
+        # is cut off partway through a header, and an Expert Info error for an impossible value
+        # (e.g., a TCP header shorter than its 20-byte minimum)
+        self.bad_packet = '_WS.MALFORMED' in raw_packet or has_expert_error(raw_packet)
 
     def __repr__(self):
         return f"Packet(timestamp={self.timestamp}, src={self.src}, dst={self.dst}, protocol={self.protocol}, transport={self.transport}, src_port={self.src_port}, dst_port={self.dst_port}, length={self.length}, flags={self.flags}, dns={self.dns}, bad_packet={self.bad_packet})"
